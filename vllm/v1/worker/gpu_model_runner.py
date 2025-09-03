@@ -77,6 +77,7 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.v1.spec_decode.policy import SpeculationController
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
@@ -200,6 +201,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 raise ValueError("Unknown speculative decoding method: "
                                  f"{self.speculative_config.method}")
             self.rejection_sampler = RejectionSampler()
+            # Adaptive speculation controller (depth/gating/ops-budget)
+            # Default parameters; could be surfaced via config in future.
+            max_d = int(self.speculative_config.num_speculative_tokens)
+            self.spec_controller = SpeculationController(
+                max_d=max_d,
+                c=0.3,               # draft/verify cost ratio threshold
+                gamma=0.0,           # verify latency slope
+                ops_budget=None,     # e.g., 1.5 if enforcing ops factor cap
+                overhead_hat_c=0.0,  # extra drafting overhead multiplier
+                ema_beta=0.6,
+            )
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}

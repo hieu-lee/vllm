@@ -34,6 +34,7 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.spec_decode.policy import SpeculationController
 
 logger = init_logger(__name__)
 
@@ -152,6 +153,16 @@ class Scheduler(SchedulerInterface):
             if speculative_config.use_eagle():
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
+            # Adaptive speculation policy (depth/gating/ops budget)
+            # Default wiring; can be made configurable.
+            self.spec_controller = SpeculationController(
+                max_d=self.num_spec_tokens,
+                c=0.3,
+                gamma=0.0,
+                ops_budget=None,
+                overhead_hat_c=0.0,
+                ema_beta=0.6,
+            )
 
         # Create the KV cache manager.
         self.kv_cache_manager = KVCacheManager(
@@ -288,13 +299,25 @@ class Scheduler(SchedulerInterface):
             req_index += 1
 
             # Speculative decode related.
+            # Optionally down-/up-scale speculative depth via controller
             if request.spec_token_ids:
                 num_scheduled_spec_tokens = (num_new_tokens +
                                              request.num_computed_tokens -
                                              request.num_tokens)
                 if num_scheduled_spec_tokens > 0:
                     # Trim spec_token_ids list to num_scheduled_spec_tokens.
-                    del request.spec_token_ids[num_scheduled_spec_tokens:]
+                    # If controller says to gate or change depth, apply here.
+                    try:
+                        desired_d = self.spec_controller.decide_depth(
+                            request.request_id)
+                        # Respect scheduled step cap.
+                        desired_d = max(0, min(desired_d,
+                                               num_scheduled_spec_tokens))
+                        del request.spec_token_ids[desired_d:]
+                        num_scheduled_spec_tokens = desired_d
+                    except Exception:
+                        # Fallback to original trim if controller unavailable
+                        del request.spec_token_ids[num_scheduled_spec_tokens:]
                     scheduled_spec_decode_tokens[request.request_id] = (
                         request.spec_token_ids)
 
@@ -886,6 +909,12 @@ class Scheduler(SchedulerInterface):
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
                     num_accepted_tokens=num_accepted)
+                # Update controller's acceptance estimate per-request.
+                try:
+                    self.spec_controller.update(req_id, num_draft_tokens,
+                                                max(0, num_accepted))
+                except Exception:
+                    pass
 
             stopped = False
             new_logprobs = None
